@@ -1,0 +1,50 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+env/
+
+# Secrets — never commit these
+.env
+*.pem
+*.key
+
+# Node
+node_modules/
+frontend/node_modules/
+dept-portal/node_modules/
+frontend/dist/
+
+# Docker
+postgres_data/
+redis_data/
+minio_data/
+*.log
+docker-compose.override.yml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# MinIO uploads (local dev)
+citysync-bucket/
+
+# Misc
+.python-version
+.pytest_cache/
+.coverage
+htmlcov/
+

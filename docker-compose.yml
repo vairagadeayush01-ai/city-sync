@@ -1,0 +1,218 @@
+services:
+  # ─── Infrastructure ────────────────────────────────────────────────────────
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: citysync_postgres
+    environment:
+      POSTGRES_DB: citysync
+      POSTGRES_USER: citysync
+      POSTGRES_PASSWORD: citysync_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - citysync
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U citysync -d citysync"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: citysync_redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - citysync
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: citysync_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: citysync_minio
+      MINIO_ROOT_PASSWORD: citysync_minio_secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - citysync
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ─── Database Setup (one-shot) ────────────────────────────────────────────
+  db-setup:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: citysync_db_setup
+    command: sh -c 'python backend/migrations/init_db.py && python backend/migrations/seed_data.py'
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://citysync:citysync_secret@postgres:5432/citysync
+      - DATABASE_URL_SYNC=postgresql://citysync:citysync_secret@postgres:5432/citysync
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - citysync
+
+  # ─── Backend Services ──────────────────────────────────────────────────────
+  # Gateway: Main entry point for citizen submissions
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: citysync_gateway
+    command: python -m gateway.main
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://citysync:citysync_secret@postgres:5432/citysync
+      - REDIS_URL=redis://redis:6379/0
+      - MINIO_ENDPOINT=minio:9000
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - citysync
+
+  # AI Pipeline: Classifies and deduplicates complaints
+  ai-pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: citysync_ai_pipeline
+    command: python -m ai_pipeline.main
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://citysync:citysync_secret@postgres:5432/citysync
+      - REDIS_URL=redis://redis:6379/0
+      - MINIO_ENDPOINT=minio:9000
+    env_file: .env
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks:
+      - citysync
+
+  # Routing: Dispatches webhooks to departments
+  routing:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: citysync_routing
+    command: python -m routing.main
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://citysync:citysync_secret@postgres:5432/citysync
+      - REDIS_URL=redis://redis:6379/0
+      # Department Portal is in the same network, use service name
+      - DEPT_PORTAL_URL=http://dept-portal:3000/webhook
+    env_file: .env
+    ports:
+      - "8001:8001"
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks:
+      - citysync
+
+  # Verification: Handshakes with field workers for resolution proof
+  verification:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: citysync_verification
+    command: python -m verification.main
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://citysync:citysync_secret@postgres:5432/citysync
+      - REDIS_URL=redis://redis:6379/0
+      - MINIO_ENDPOINT=minio:9000
+    env_file: .env
+    ports:
+      - "8002:8002"
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks:
+      - citysync
+
+  # Notifications: SMS/Email dispatcher
+  notifications:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: citysync_notifications
+    command: python -m notifications.main
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://citysync:citysync_secret@postgres:5432/citysync
+      - REDIS_URL=redis://redis:6379/0
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - citysync
+
+  # ─── UI Services ───────────────────────────────────────────────────────────
+  # Citizen PWA (React/Vite)
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: citysync_frontend
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    ports:
+      - "5173:5173"
+    networks:
+      - citysync
+
+  # Department Portal (Node/Express)
+  dept-portal:
+    build:
+      context: .
+      dockerfile: Dockerfile.portal
+    container_name: citysync_dept_portal
+    environment:
+      - PORT=3000
+    ports:
+      - "3000:3000"
+    networks:
+      - citysync
+
+networks:
+  citysync:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
